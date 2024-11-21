@@ -8,6 +8,10 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use serde_json::Value;
 use tokio::signal;
+use tempfile::tempdir; // Add this import
+use tokio::process::Command; // Add this import
+use tokio::fs;
+// Removed: use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -75,26 +79,150 @@ async fn echo(
             };
 
             if let Value::Object(map) = s {
+                // Validate filenames
                 for filename in map.keys() {
                     if !filename.ends_with(".rs") || filename.contains("..") {
                         let mut response = Response::new(full("Grrrrr(ust)."));
                         *response.status_mut() = StatusCode::FORBIDDEN;
                         return Ok(response);
                     }
-                    println!("filename: {}", filename);
-                    // curl -H 'Content-Type: application/json' http://127.0.0.1:3000/remote-build -d '{"src/main.rs":"foo","build.rs":"bar"}'
-                    // TODO create temp directory
-                    // TODO write files form map on the temp directory
-                    // TODO run cargo build
-                    // TODO Finally serve the binary
-                    // TODO Finally remove the temp directory
                 }
-            } else {
-                println!("Expected an object in JSON blob");
+
+                // Create temp directory
+                let temp_dir = match tempdir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!("Failed to create temp directory: {:?}", e);
+                        let mut response = Response::new(full("Internal Server Error"));
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return Ok(response);
+                    },
+                };
+
+                // Create src directory
+                let src_dir = temp_dir.path().join("src");
+                if let Err(e) = fs::create_dir_all(&src_dir).await {
+                    eprintln!("Failed to create src directory: {:?}", e);
+                    let mut response = Response::new(full("Internal Server Error"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+
+                // Write files to src directory
+                for (filename, content) in &map {
+                    // Ensure that the content is a string
+                    let content_str = match content.as_str() {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("Content for file {} is not a string", filename);
+                            let mut response = Response::new(full("Invalid content type for file"));
+                            *response.status_mut() = StatusCode::BAD_REQUEST;
+                            return Ok(response);
+                        }
+                    };
+
+                    let file_path = temp_dir.path().join(filename);
+                    if let Some(parent) = file_path.parent() {
+                        if let Err(e) = fs::create_dir_all(parent).await {
+                            eprintln!("Failed to create directories for {}: {:?}", filename, e);
+                            let mut response = Response::new(full("Internal Server Error"));
+                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok(response);
+                        }
+                    }
+                    if let Err(e) = fs::write(&file_path, content_str.as_bytes()).await {
+                        eprintln!("Failed to write file {}: {:?}", filename, e);
+                        let mut response = Response::new(full("Internal Server Error"));
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return Ok(response);
+                    }
+                }
+
+                // Create Cargo.toml
+                let cargo_toml = r#"
+[package]
+name = "temp_build"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"#;
+                if let Err(e) = fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).await {
+                    eprintln!("Failed to write Cargo.toml: {:?}", e);
+                    let mut response = Response::new(full("Internal Server Error"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+
+                // Run cargo build --release
+                let build_output = match Command::new("cargo")
+                    .args(&["build", "--release"])
+                    .current_dir(temp_dir.path())
+                    .output()
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(e) => {
+                        eprintln!("Failed to execute cargo build: {:?}", e);
+                        let mut response = Response::new(full("Internal Server Error"));
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return Ok(response);
+                    },
+                };
+
+                if !build_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&build_output.stderr);
+                    eprintln!("Build failed: {}", stderr);
+                    let mut response = Response::new(full(format!("Build failed: {}", stderr)));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return Ok(response);
+                }
+
+                // Determine binary name based on OS
+                let binary_name = if cfg!(windows) {
+                    "temp_build.exe"
+                } else {
+                    "temp_build"
+                };
+
+                let binary_path = temp_dir.path()
+                    .join("target")
+                    .join("release")
+                    .join(binary_name);
+
+                if !binary_path.exists() {
+                    eprintln!("Built binary not found at {:?}", binary_path);
+                    let mut response = Response::new(full("Built binary not found"));
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return Ok(response);
+                }
+
+                // Read the binary file
+                let binary = match fs::read(&binary_path).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("Failed to read binary: {:?}", e);
+                        let mut response = Response::new(full("Internal Server Error"));
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return Ok(response);
+                    },
+                };
+
+                // Optionally, you can drop the temp_dir here, but it's automatically cleaned up
+
+                // Respond with the binary
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Disposition", "attachment; filename=\"binary\"")
+                    .body(full(binary))
+                    .unwrap();
+
+                return Ok(response);
             }
 
-            let mut response = Response::new(full(["Work done, TODO serve final bin"].concat()));
-            response.headers_mut().insert("Content-Type", "text/plain".parse().unwrap());
+            let mut response = Response::new(full("Invalid JSON structure"));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
             Ok(response)
         }
         _ => {

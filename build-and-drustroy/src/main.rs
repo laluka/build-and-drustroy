@@ -2,20 +2,19 @@ use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, HeaderMap};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use serde_json::Value;
-use tokio::signal;
-use tempfile::tempdir; // Add this import
-use tokio::process::Command; // Add this import
+use std::net::SocketAddr;
+use tempfile::tempdir;
 use tokio::fs;
-// Removed: use std::path::Path;
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::signal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = TcpListener::bind(addr).await?;
     println!("Server running on http://{}", addr);
 
@@ -53,14 +52,13 @@ async fn echo(
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => {
-            let mut response = Response::new(full(
-                "If you're here, you should read more code.",
-            ));
-            response.headers_mut().insert("Content-Type", "text/plain".parse().unwrap());
+            let mut response = Response::new(full("If you're here, you should read more code."));
+            response
+                .headers_mut()
+                .insert("Content-Type", "text/plain".parse().unwrap());
             Ok(response)
-        },
+        }
         (&Method::POST, "/remote-build") => {
-            // Validate Content-Type
             if !is_content_type_json(req.headers()) {
                 let mut response = Response::new(full("Content-Type must be application/json"));
                 *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
@@ -75,11 +73,10 @@ async fn echo(
                     let mut response = Response::new(full("Error parsing JSON"));
                     *response.status_mut() = StatusCode::BAD_REQUEST;
                     return Ok(response);
-                },
+                }
             };
 
             if let Value::Object(map) = s {
-                // Validate filenames
                 for filename in map.keys() {
                     if !filename.ends_with(".rs") || filename.contains("..") {
                         let mut response = Response::new(full("Grrrrr(ust)."));
@@ -88,7 +85,6 @@ async fn echo(
                     }
                 }
 
-                // Create temp directory
                 let temp_dir = match tempdir() {
                     Ok(dir) => dir,
                     Err(e) => {
@@ -96,10 +92,9 @@ async fn echo(
                         let mut response = Response::new(full("Internal Server Error"));
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return Ok(response);
-                    },
+                    }
                 };
 
-                // Create src directory
                 let src_dir = temp_dir.path().join("src");
                 if let Err(e) = fs::create_dir_all(&src_dir).await {
                     eprintln!("Failed to create src directory: {:?}", e);
@@ -108,9 +103,7 @@ async fn echo(
                     return Ok(response);
                 }
 
-                // Write files to src directory
                 for (filename, content) in &map {
-                    // Ensure that the content is a string
                     let content_str = match content.as_str() {
                         Some(s) => s,
                         None => {
@@ -138,7 +131,6 @@ async fn echo(
                     }
                 }
 
-                // Create Cargo.toml
                 let cargo_toml = r#"
 [package]
 name = "temp_build"
@@ -154,7 +146,6 @@ edition = "2021"
                     return Ok(response);
                 }
 
-                // Run cargo build --release
                 let build_output = match Command::new("cargo")
                     .args(&["build", "--release"])
                     .current_dir(temp_dir.path())
@@ -167,7 +158,7 @@ edition = "2021"
                         let mut response = Response::new(full("Internal Server Error"));
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return Ok(response);
-                    },
+                    }
                 };
 
                 if !build_output.status.success() {
@@ -178,14 +169,14 @@ edition = "2021"
                     return Ok(response);
                 }
 
-                // Determine binary name based on OS
                 let binary_name = if cfg!(windows) {
                     "temp_build.exe"
                 } else {
                     "temp_build"
                 };
 
-                let binary_path = temp_dir.path()
+                let binary_path = temp_dir
+                    .path()
                     .join("target")
                     .join("release")
                     .join(binary_name);
@@ -197,7 +188,6 @@ edition = "2021"
                     return Ok(response);
                 }
 
-                // Read the binary file
                 let binary = match fs::read(&binary_path).await {
                     Ok(data) => data,
                     Err(e) => {
@@ -205,12 +195,9 @@ edition = "2021"
                         let mut response = Response::new(full("Internal Server Error"));
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return Ok(response);
-                    },
+                    }
                 };
 
-                // Optionally, you can drop the temp_dir here, but it's automatically cleaned up
-
-                // Respond with the binary
                 let response = Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/octet-stream")
@@ -235,7 +222,10 @@ edition = "2021"
 
 fn is_content_type_json(headers: &HeaderMap) -> bool {
     match headers.get("Content-Type") {
-        Some(ct) => ct.to_str().map(|s| s.starts_with("application/json")).unwrap_or(false),
+        Some(ct) => ct
+            .to_str()
+            .map(|s| s.starts_with("application/json"))
+            .unwrap_or(false),
         None => false,
     }
 }
